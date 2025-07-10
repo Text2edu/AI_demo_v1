@@ -7,13 +7,19 @@ from typing import Optional
 from tenacity import retry, stop_after_attempt, wait_exponential
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
+import streamlit as st
 from dotenv import load_dotenv
 load_dotenv()
 # Configuration
-PROJECT_ID = os.getenv("VERTEX_PROJECT_ID", "production-ai-461211")
-LOCATION = os.getenv("VERTEX_LOCATION", "us-east5")
 MODEL_ID = "gemini-2.5-flash"
-GOOGLE_APPLICATIONS_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATIONS_CREDENTIALS_JSON")
+PROJECT_ID = st.secrets["VERTEX_PROJECT_ID"]
+LOCATION = st.secrets["VERTEX_LOCATION"]
+SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
+
+# The JSON string for credentials will need to be parsed
+google_applications_credentials_json_str = st.secrets["GOOGLE_APPLICATIONS_CREDENTIALS_JSON"]
+GOOGLE_APPLICATIONS_CREDENTIALS_JSON = json.loads(google_applications_credentials_json_str)
+
 
 CHAT_SYSTEM_PROMPT = """You are a Marketing Intelligence Chat Orchestrator for OmniActive Health Technologies. 
 
