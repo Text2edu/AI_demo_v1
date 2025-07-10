@@ -6,3 +6,4 @@ google-auth-oauthlib==1.0.0
 google-cloud-aiplatform==1.38.0
 tenacity==8.2.3
 asyncio
+python-dotenv==1.0.1
