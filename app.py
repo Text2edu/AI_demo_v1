@@ -1,483 +1,355 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Body
-from pydantic import BaseModel
-from typing import List, Optional
-import boto3
+import streamlit as st
+import asyncio
 import json
-import random
 import time
-from dotenv import load_dotenv
-import concurrent.futures
-import math
-import urllib.request
-import os
-import tempfile
-import uuid
-import pusher
-from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip
-from elevenlabs.client import ElevenLabs
-import io
+from datetime import datetime
+from chat import chat_orchestrator
+from web_intel import web_intelligence_agent
+from social_intel import social_intelligence_agent
+from comp_intel import competitive_intelligence_agent
 
-app = FastAPI(title="Educational Video Generator API")
-
-load_dotenv()
-
-# Configuration
-AWS_REGION = "us-east-1"
-MODEL_ID_NOVA = "amazon.nova-reel-v1:0"
-MODEL_ID_MISTRAL = "mistral.mistral-large-2402-v1:0"
-S3_OUTPUT_BUCKET = "bedrock-video-generation-us-east-1-73hol2"
-
-# Initialize clients
-bedrock_runtime = boto3.client(service_name="bedrock-runtime", region_name=AWS_REGION)
-eleven_labs = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-
-# Initialize Pusher
-pusher_client = pusher.Pusher(
-    app_id=os.getenv('PUSHER_APP_ID', ''),
-    key=os.getenv('PUSHER_KEY', ''),
-    secret=os.getenv('PUSHER_SECRET', ''),
-    cluster=os.getenv('PUSHER_CLUSTER', 'ap2'),
-    ssl=True
+# Page configuration
+st.set_page_config(
+    page_title="OmniActive Marketing Intelligence",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Data Models
-class TopicRequest(BaseModel):
-    topic: str
-    session_id: str
-
-class VideoGenerationRequest(BaseModel):
-    session_id: str
-    include_narration: bool = True
-
-class PromptResponse(BaseModel):
-    session_id: str
-    scene_prompts: List[str]
-    audio_prompts: List[str]
-
-class VideoResponse(BaseModel):
-    session_id: str
-    video_urls: List[str]
-    status: str
-
-# Session storage (in a production app, use Redis or a database)
-sessions = {}
-
-def send_update(session_id, event, data):
-    """Send real-time update via Pusher"""
-    try:
-        pusher_client.trigger(f'session-{session_id}', event, data)
-    except Exception as e:
-        print(f"Pusher error: {e}")
-
-def generate_prompts(topic, session_id):
-    user_msg = f"""
-    You are an expert video scriptwriter specializing in creating educational content. 
-    I will provide you with an educational topic. 
-    Your task is to generate 10 detailed scene prompts for a 6-second video sequence and 10 corresponding audio prompts.
-
-    **Topic:** {topic}
-
-    **Output Format:**
-
-    **Scene Prompts:**
-    Scene 1: [Detailed description of length 75 words of the first 6-second scene]
-    Scene 2: [Detailed description of length 75 words of the second 6-second scene]
-    ...
-    Scene 10: [Detailed description of length 75 words of the tenth 6-second scene]
-
-    **Audio Prompts:**
-    Audio 1: [Corresponding audio narration for Scene 1]
-    Audio 2: [Corresponding audio narration for Scene 2]
-    ...
-    Audio 10: [Corresponding audio narration for Scene 10]
-
-    Please ensure the scene prompts are visually descriptive and the audio prompts are clear and concise. 
-    Maintain a consistent educational tone throughout.
-    """
-
-    messages = [{"role": "user", "content": [{"text": user_msg}]}]
-    temperature = 0.0
-    max_tokens = 2048
-
-    send_update(session_id, "status_update", {"message": "Generating prompts..."})
-    
-    params = {"modelId": MODEL_ID_MISTRAL,
-              "messages": messages,
-              "inferenceConfig": {"temperature": temperature,
-                                  "maxTokens": max_tokens}}
-
-    try:
-        resp = bedrock_runtime.converse(**params)
-        return resp["output"]["message"]["content"][0]["text"]
-    except Exception as e:
-        send_update(session_id, "error", {"message": f"Error generating prompts: {str(e)}"})
-        raise e
-
-def parse_prompts(response):
-    scene_prompts = []
-    audio_prompts = []
-    lines = response.split('\n')
-    scene_section = False
-    audio_section = False
-
-    for line in lines:
-        line = line.strip()
-        if line.lower().startswith("**scene prompts:**"):
-            scene_section = True
-            audio_section = False
-            continue
-        elif line.lower().startswith("**audio prompts:**"):
-            audio_section = True
-            scene_section = False
-            continue
-
-        if scene_section and line.startswith("Scene"):
-            scene_prompts.append(line.split(": ", 1)[1].strip())
-        elif audio_section and line.startswith("Audio"):
-            audio_prompts.append(line.split(": ", 1)[1].strip())
-
-    return scene_prompts, audio_prompts
-
-def generate_audio_narrations(audio_prompts, session_id):
-    """Generate all audio narrations at once"""
-    send_update(session_id, "status_update", {"message": "Generating audio narrations..."})
-    
-    combined_text = ""
-    for i, prompt in enumerate(audio_prompts):
-        combined_text += f"{prompt}\n\n"
-    
-    try:
-        # Use a temp directory for audio files
-        temp_dir = tempfile.mkdtemp()
-        audio_path = os.path.join(temp_dir, f"narrations_{session_id}.mp3")
-        
-        # Generate the audio
-        audio_generator = eleven_labs.text_to_speech.convert(
-            text=combined_text,
-            voice_id="JBFqnCBsd6RMkjVDRZzb",
-            model_id="eleven_multilingual_v2",
-            output_format="mp3_44100_128",
-        )
-        
-        # Collect all chunks from the generator into a single byte array
-        audio_bytes = b""
-        for chunk in audio_generator:
-            if chunk:
-                audio_bytes += chunk
-        
-        # Save the audio to a file
-        with open(audio_path, "wb") as f:
-            f.write(audio_bytes)
-            
-        send_update(session_id, "audio_complete", {"message": "Audio narrations completed!"})
-        return audio_path
-    except Exception as e:
-        send_update(session_id, "error", {"message": f"Error generating audio narrations: {str(e)}"})
-        raise e
-
-def generate_video(video_prompt, video_number, session_id):
-    combined_prompt = f"{video_prompt}"
-    
-    send_update(session_id, "status_update", {
-        "message": f"Starting video {video_number} generation...",
-        "video_number": video_number
-    })
-
-    model_input = {
-        "taskType": "TEXT_VIDEO",
-        "textToVideoParams": {
-            "text": combined_prompt
-        },
-        "videoGenerationConfig": {
-            "durationSeconds": 6,
-            "fps": 24,
-            "dimension": "1280x720",
-            "seed": random.randint(0, 2147483648)
-        }
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        background: linear-gradient(90deg, #1e3c72 0%, #2a5298 100%);
+        padding: 2rem;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+        text-align: center;
     }
+    
+    .main-header h1 {
+        color: white;
+        margin: 0;
+        font-size: 2.5rem;
+        font-weight: bold;
+    }
+    
+    .main-header p {
+        color: #e0e0e0;
+        margin: 0.5rem 0 0 0;
+        font-size: 1.1rem;
+    }
+    
+    .agent-card {
+        background: #f8f9fa;
+        padding: 1.5rem;
+        border-radius: 10px;
+        border-left: 4px solid #2a5298;
+        margin: 1rem 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    
+    .agent-response {
+        background: #000000;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 0.5rem 0;
+        border-left: 3px solid #17a2b8;
+    }
+    
+    .user-message {
+        background: #000000;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 0.5rem 0;
+        border-left: 3px solid #ffc107;
+    }
+    
+    .status-indicator {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        margin-right: 8px;
+    }
+    
+    .status-active {
+        background-color: #28a745;
+        animation: pulse 2s infinite;
+    }
+    
+    .status-inactive {
+        background-color: #6c757d;
+    }
+    
+    @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.5; }
+        100% { opacity: 1; }
+    }
+    
+    .metric-card {
+        background: black;
+        padding: 1rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        text-align: center;
+        margin: 0.5rem 0;
+    }
+    
+    .stButton > button {
+        background-color: #2a5298;
+        color: black;
+        border: none;
+        border-radius: 5px;
+        padding: 0.5rem 1rem;
+        font-weight: bold;
+        width: 100%;
+    }
+    
+    .stButton > button:hover {
+        background-color: #1e3c72;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-    output_config = {"s3OutputDataConfig": {"s3Uri": f"s3://{S3_OUTPUT_BUCKET}"}}
+# Initialize session state
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'agent_history' not in st.session_state:
+    st.session_state.agent_history = []
+if 'current_agent' not in st.session_state:
+    st.session_state.current_agent = None
+if 'processing' not in st.session_state:
+    st.session_state.processing = False
 
-    try:
-        invocation = bedrock_runtime.start_async_invoke(
-            modelId=MODEL_ID_NOVA,
-            modelInput=model_input,
-            outputDataConfig=output_config
-        )
+# Header
+st.markdown("""
+<div class="main-header">
+    <h1>🧠 OmniActive Marketing Intelligence</h1>
+    <p>AI-Powered Multi-Agent Market Research Platform</p>
+</div>
+""", unsafe_allow_html=True)
 
-        invocation_arn = invocation["invocationArn"]
-        s3_prefix = invocation_arn.split('/')[-1]
-        s3_key = f"{s3_prefix}/output.mp4"
-        https_url = f"https://{S3_OUTPUT_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+# Sidebar
+with st.sidebar:
+    st.header("🎯 Agent Dashboard")
+    
+    # Agent status indicators
+    st.subheader("Agent Status")
+    
+    agents = [
+        {"name": "Chat Orchestrator", "status": "active" if not st.session_state.processing else "inactive"},
+        {"name": "Web Intelligence", "status": "active" if st.session_state.current_agent == "web_intelligence_agent" else "inactive"},
+        {"name": "Social Intelligence", "status": "active" if st.session_state.current_agent == "social_intelligence_agent" else "inactive"},
+        {"name": "Competitive Intelligence", "status": "active" if st.session_state.current_agent == "competitive_intelligence_agent" else "inactive"}
+    ]
+    
+    for agent in agents:
+        status_class = "status-active" if agent["status"] == "active" else "status-inactive"
+        st.markdown(f"""
+        <div style="display: flex; align-items: center; margin: 0.5rem 0;">
+            <span class="status-indicator {status_class}"></span>
+            <span>{agent['name']}</span>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.divider()
+    
+    # Quick actions
+    st.subheader("🚀 Quick Actions")
+    
+    if st.button("🔍 Market Trends Analysis"):
+        st.session_state.quick_query = "What are the latest trends in the nutraceutical market?"
         
-        send_update(session_id, "status_update", {
-            "message": f"Initiated video {video_number} generation.",
-            "video_number": video_number
-        })
+    if st.button("📱 Social Sentiment Check"):
+        st.session_state.quick_query = "How do customers feel about OmniActive products on social media?"
+        
+    if st.button("🏆 Competitive Analysis"):
+        st.session_state.quick_query = "What are our main competitors doing in the lutein market?"
+        
+    if st.button("📊 Product Performance"):
+        st.session_state.quick_query = "How is Lutemax performing in the market?"
+    
+    st.divider()
+    
+    # Session stats
+    st.subheader("📈 Session Stats")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Total Queries", len(st.session_state.messages))
+    with col2:
+        st.metric("Agents Used", len(set(agent['agent'] for agent in st.session_state.agent_history)))
+    
+    # Clear chat button
+    if st.button("🗑️ Clear Chat", type="secondary"):
+        st.session_state.messages = []
+        st.session_state.agent_history = []
+        st.session_state.current_agent = None
+        st.rerun()
 
-        SLEEP_TIME = 30
-        while True:
-            response = bedrock_runtime.get_async_invoke(invocationArn=invocation_arn)
-            status = response["status"]
-            send_update(session_id, "status_update", {
-                "message": f"Video {video_number} Status: {status}",
-                "video_number": video_number,
-                "status": status
-            })
-            if status != "InProgress":
+# Main chat interface
+col1, col2 = st.columns([3, 1])
+
+with col1:
+    st.subheader("💬 Chat Interface")
+    
+    # Chat container
+    chat_container = st.container()
+    
+    with chat_container:
+        # Display chat messages
+        for message in st.session_state.messages:
+            if message['role'] == 'user':
+                st.markdown(f"""
+                <div class="user-message">
+                    <strong>You:</strong> {message['content']}
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="agent-response">
+                    <strong>{message.get('agent', 'Assistant')}:</strong> {message['content']}
+                </div>
+                """, unsafe_allow_html=True)
+    
+    # Chat input
+    if 'quick_query' in st.session_state:
+        user_input = st.session_state.quick_query
+        del st.session_state.quick_query
+    else:
+        user_input = st.chat_input("Ask about market trends, competitor analysis, or social sentiment...")
+    
+    if user_input and not st.session_state.processing:
+        # Add user message
+        st.session_state.messages.append({
+            'role': 'user',
+            'content': user_input,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Process the query
+        st.session_state.processing = True
+        st.rerun()
+
+with col2:
+    st.subheader("📊 Agent Activity")
+    
+    # Show recent agent activity
+    if st.session_state.agent_history:
+        st.write("Recent Agent Actions:")
+        for i, activity in enumerate(st.session_state.agent_history[-5:]):
+            with st.expander(f"{activity['agent']} - {activity['timestamp'][:16]}"):
+                st.write(f"**Task:** {activity['task']}")
+                st.write(f"**Status:** {activity['status']}")
+                if activity.get('next_action'):
+                    st.write(f"**Next Action:** {activity['next_action']}")
+    else:
+        st.info("No agent activity yet. Start a conversation to see agent actions!")
+
+# Process user input
+async def process_query(query: str):
+    """Process user query through the agent chain"""
+    try:
+        context = " ".join([msg['content'] for msg in st.session_state.messages[-3:] if msg['role'] == 'user'])
+        
+        # Start with chat orchestrator
+        response = await chat_orchestrator(query, context)
+        
+        # Add orchestrator response
+        st.session_state.messages.append({
+            'role': 'assistant',
+            'content': response['response'],
+            'agent': 'Chat Orchestrator',
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Track agent activity
+        st.session_state.agent_history.append({
+            'agent': 'Chat Orchestrator',
+            'task': query,
+            'status': 'completed',
+            'timestamp': datetime.now().isoformat(),
+            'next_action': response['next_action']
+        })
+        
+        # Process through agents chain
+        current_response = response
+        max_iterations = 3
+        iteration = 0
+        
+        while current_response['next_action'] != 'stop' and iteration < max_iterations:
+            iteration += 1
+            next_agent = current_response['next_action']
+            agent_prompt = current_response['agent_prompt']
+            
+            st.session_state.current_agent = next_agent
+            
+            # Call the appropriate agent
+            if next_agent == 'web_intelligence_agent':
+                current_response = await web_intelligence_agent(agent_prompt)
+                agent_name = 'Web Intelligence Agent'
+            elif next_agent == 'social_intelligence_agent':
+                current_response = await social_intelligence_agent(agent_prompt)
+                agent_name = 'Social Intelligence Agent'
+            elif next_agent == 'competitive_intelligence_agent':
+                current_response = await competitive_intelligence_agent(agent_prompt)
+                agent_name = 'Competitive Intelligence Agent'
+            else:
                 break
-            time.sleep(SLEEP_TIME)
-
-        if status == "Completed":
-            send_update(session_id, "video_complete", {
-                "message": f"Video {video_number} is ready",
-                "video_number": video_number,
-                "url": https_url
-            })
-            return https_url
-        else:
-            failure_message = response.get('failureMessage', 'Unknown error')
-            send_update(session_id, "error", {
-                "message": f"Video {video_number} generation failed: {failure_message}",
-                "video_number": video_number
-            })
-            return None
-    except Exception as e:
-        send_update(session_id, "error", {
-            "message": f"Error generating video {video_number}: {str(e)}",
-            "video_number": video_number
-        })
-        return None
-
-def process_batch(batch_prompts, batch_number, total_batches, session_id):
-    send_update(session_id, "status_update", {
-        "message": f"Processing batch {batch_number} of {total_batches}...",
-        "batch": batch_number,
-        "total_batches": total_batches
-    })
-    
-    video_urls = []
-    futures = []
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        for i, (scene_index, scene_prompt) in enumerate(batch_prompts):
-            future = executor.submit(generate_video, scene_prompt, scene_index + 1, session_id)
-            futures.append((scene_index, future))
-
-        completed_count = 0
-        for scene_index, future in sorted(futures, key=lambda x: x[0]):
-            url = future.result()
-            video_urls.append((scene_index, url))
-            completed_count += 1
-            send_update(session_id, "batch_progress", {
-                "message": f"Batch {batch_number}: videos completed: {completed_count}/{len(futures)}",
-                "batch": batch_number,
-                "completed": completed_count,
-                "total": len(futures)
-            })
-    
-    return video_urls
-
-def download_video(url, output_path, session_id):
-    """Download video from URL to a local path"""
-    try:
-        urllib.request.urlretrieve(url, output_path)
-        return True
-    except Exception as e:
-        send_update(session_id, "error", {"message": f"Error downloading video: {str(e)}"})
-        return False
-
-def stitch_videos(video_urls, audio_path, session_id):
-    """Stitch multiple videos together and optionally add audio"""
-    # Create a temp directory
-    temp_dir = tempfile.mkdtemp()
-    video_paths = []
-    
-    # Download all videos
-    send_update(session_id, "status_update", {"message": "Downloading videos..."})
-    for i, url in enumerate(video_urls):
-        if url:
-            video_path = os.path.join(temp_dir, f"video_{i+1}.mp4")
-            if download_video(url, video_path, session_id):
-                video_paths.append(video_path)
-    
-    if not video_paths:
-        send_update(session_id, "error", {"message": "No videos were successfully downloaded."})
-        return None
-    
-    # Stitch videos
-    send_update(session_id, "status_update", {"message": "Stitching videos together..."})
-    try:
-        clips = [VideoFileClip(path) for path in video_paths]
-        combined_clip = concatenate_videoclips(clips)
-        
-        # Add audio if provided
-        if audio_path and os.path.exists(audio_path):
-            audio_clip = AudioFileClip(audio_path)
-            # Make sure audio doesn't exceed video length
-            if audio_clip.duration > combined_clip.duration:
-                audio_clip = audio_clip.subclipped(0, combined_clip.duration)
-            combined_clip = combined_clip.set_audio(audio_clip) if hasattr(combined_clip, 'set_audio') \
-                else combined_clip.with_audio(audio_clip)
-        
-        # Generate a unique filename for the output
-        output_path = os.path.join(temp_dir, f"combined_{uuid.uuid4().hex}.mp4")
-        combined_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
-        
-        # Close all clips to free memory
-        for clip in clips:
-            clip.close()
-        if audio_path and os.path.exists(audio_path):
-            audio_clip.close()
-        combined_clip.close()
-        
-        # Save output path to S3 or other storage for access
-        # For now, we'll use a local path but in production you'd upload to cloud storage
-        public_url = f"/videos/{os.path.basename(output_path)}"
-        send_update(session_id, "combined_complete", {
-            "message": "Combined video is ready",
-            "url": public_url
-        })
-        
-        return output_path
-    except Exception as e:
-        send_update(session_id, "error", {"message": f"Error stitching videos: {str(e)}"})
-        return None
-
-async def process_topic_async(topic: str, session_id: str):
-    try:
-        # Generate prompts
-        response = generate_prompts(topic, session_id)
-        scene_prompts, audio_prompts = parse_prompts(response)
-        
-        # Store in session
-        sessions[session_id] = {
-            "topic": topic,
-            "scene_prompts": scene_prompts,
-            "audio_prompts": audio_prompts,
-            "video_urls": [],
-            "narration_audio": None,
-            "combined_video_path": None
-        }
-        
-        # Send prompts to client
-        send_update(session_id, "prompts_ready", {
-            "scene_prompts": scene_prompts,
-            "audio_prompts": audio_prompts
-        })
-        
-        # Generate audio narrations
-        narration_audio = generate_audio_narrations(audio_prompts, session_id)
-        sessions[session_id]["narration_audio"] = narration_audio
-        
-        # Prepare indexed prompts
-        indexed_prompts = list(enumerate(scene_prompts))
-        BATCH_SIZE = 5
-        total_batches = math.ceil(len(indexed_prompts) / BATCH_SIZE)
-        
-        all_video_urls = []
-        # Process in batches
-        for batch_idx in range(total_batches):
-            start_idx = batch_idx * BATCH_SIZE
-            end_idx = min(start_idx + BATCH_SIZE, len(indexed_prompts))
-            batch = indexed_prompts[start_idx:end_idx]
             
-            batch_urls = process_batch(batch, batch_idx + 1, total_batches, session_id)
-            all_video_urls.extend(batch_urls)
+            # Add agent response
+            st.session_state.messages.append({
+                'role': 'assistant',
+                'content': current_response['response'],
+                'agent': agent_name,
+                'timestamp': datetime.now().isoformat()
+            })
             
-        # Sort by original index
-        all_video_urls.sort(key=lambda x: x[0])
-        final_urls = [url for _, url in all_video_urls if url]
-        sessions[session_id]["video_urls"] = final_urls
+            # Track agent activity
+            st.session_state.agent_history.append({
+                'agent': agent_name,
+                'task': agent_prompt,
+                'status': 'completed',
+                'timestamp': datetime.now().isoformat(),
+                'next_action': current_response['next_action']
+            })
         
-        send_update(session_id, "videos_ready", {
-            "message": "All videos are ready",
-            "urls": final_urls
+        st.session_state.current_agent = None
+        
+    except Exception as e:
+        st.error(f"Error processing query: {str(e)}")
+        st.session_state.messages.append({
+            'role': 'assistant',
+            'content': f"I encountered an error: {str(e)}. Please try again.",
+            'agent': 'System',
+            'timestamp': datetime.now().isoformat()
         })
+    
+    finally:
+        st.session_state.processing = False
+
+# Handle processing
+if st.session_state.processing and st.session_state.messages:
+    with st.spinner("🤖 Processing your query through the agent network..."):
+        # Get the last user message
+        last_user_message = None
+        for msg in reversed(st.session_state.messages):
+            if msg['role'] == 'user':
+                last_user_message = msg['content']
+                break
         
-    except Exception as e:
-        send_update(session_id, "error", {"message": f"Error processing topic: {str(e)}"})
+        if last_user_message:
+            # Run the async function
+            asyncio.run(process_query(last_user_message))
+            st.rerun()
 
-async def stitch_videos_async(session_id: str, include_narration: bool):
-    try:
-        session = sessions.get(session_id)
-        if not session:
-            send_update(session_id, "error", {"message": "Session not found"})
-            return
-        
-        video_urls = session.get("video_urls", [])
-        if not video_urls:
-            send_update(session_id, "error", {"message": "No videos available for stitching"})
-            return
-        
-        audio_path = session.get("narration_audio") if include_narration else None
-        
-        combined_path = stitch_videos(video_urls, audio_path, session_id)
-        if combined_path:
-            sessions[session_id]["combined_video_path"] = combined_path
-            # In a real app, you'd generate a secure URL to this file or upload to cloud storage
-    except Exception as e:
-        send_update(session_id, "error", {"message": f"Error stitching videos: {str(e)}"})
-
-# API Endpoints
-@app.post("/api/generate-prompts", response_model=PromptResponse)
-async def create_prompts(request: TopicRequest, background_tasks: BackgroundTasks):
-    session_id = request.session_id
-    topic = request.topic
-    
-    if not session_id:
-        session_id = str(uuid.uuid4())
-    
-    # Start processing in background
-    background_tasks.add_task(process_topic_async, topic, session_id)
-    
-    return {"session_id": session_id, "scene_prompts": [], "audio_prompts": []}
-
-@app.post("/api/combine-videos", response_model=VideoResponse)
-async def combine_videos(request: VideoGenerationRequest, background_tasks: BackgroundTasks):
-    session_id = request.session_id
-    
-    if not session_id or session_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Start video stitching in background
-    background_tasks.add_task(stitch_videos_async, session_id, request.include_narration)
-    
-    return {
-        "session_id": session_id,
-        "video_urls": sessions[session_id].get("video_urls", []),
-        "status": "processing"
-    }
-
-@app.get("/api/session/{session_id}")
-async def get_session(session_id: str):
-    if session_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session = sessions[session_id]
-    return {
-        "session_id": session_id,
-        "topic": session.get("topic", ""),
-        "scene_prompts": session.get("scene_prompts", []),
-        "audio_prompts": session.get("audio_prompts", []),
-        "video_urls": session.get("video_urls", []),
-        "has_narration": session.get("narration_audio") is not None,
-        "has_combined_video": session.get("combined_video_path") is not None
-    }
-
-# Serve static files - in production use nginx/cloudfront for this
-@app.get("/videos/{video_name}")
-async def get_video(video_name: str):
-    # This is just a placeholder - in production you'd use proper file serving
-    # or return a signed URL to cloud storage
-    from fastapi.responses import FileResponse
-    
-    for session_id, session in sessions.items():
-        combined_path = session.get("combined_video_path")
-        if combined_path and os.path.basename(combined_path) == video_name:
-            return FileResponse(combined_path)
-    
-    raise HTTPException(status_code=404, detail="Video not found")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; color: #666;">
+    <p>🧠 OmniActive Marketing Intelligence Platform | Powered by Multi-Agent AI</p>
+    <p>Real-time market research • Social listening • Competitive intelligence</p>
+</div>
+""", unsafe_allow_html=True)
