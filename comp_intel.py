@@ -17,7 +17,7 @@ SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
 
 # The JSON string for credentials will need to be parsed
 google_applications_credentials_json_str = st.secrets["GOOGLE_APPLICATIONS_CREDENTIALS_JSON"]
-GOOGLE_APPLICATIONS_CREDENTIALS_JSON = json.loads(google_applications_credentials_json_str)
+GOOGLE_APPLICATIONS_CREDENTIALS_JSON = google_applications_credentials_json_str
 
 COMPETITIVE_INTELLIGENCE_SYSTEM_PROMPT = """You are a Competitive Intelligence Agent for OmniActive Health Technologies marketing research.
 
