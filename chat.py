@@ -1,15 +1,17 @@
-
 import os
 import json
 import asyncio
 import requests
+import re
 from typing import Optional
 from tenacity import retry, stop_after_attempt, wait_exponential
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 import streamlit as st
 from dotenv import load_dotenv
+
 load_dotenv()
+
 # Configuration
 MODEL_ID = "gemini-2.5-flash"
 PROJECT_ID = st.secrets["VERTEX_PROJECT_ID"]
@@ -44,8 +46,8 @@ Use "stop" when:
 
 Examples:
 - "What are the latest trends in nutraceuticals?" → web_intelligence_agent
-- "How do customers feel about Lutemax?" → social_intelligence_agent  
-- "What is DSM doing in the lutein market?" → competitive_intelligence_agent
+- "How do customers feel about OmniActive products on social media? What are the other companies which are using omniactive in different countries" → social_intelligence_agent  
+- "Can u give me multiple reviews from reddit google flipkart amazon etc for Lutemax and also mention 3-4 companies which use Lutemax in their products" → competitive_intelligence_agent
 - "Hello, how are you?" → stop
 
 Always be helpful and professional. Focus on OmniActive's products like Lutemax, Capsimax, and other nutraceutical ingredients."""
@@ -107,6 +109,27 @@ def make_gemini_request(prompt: str, max_tokens: int = 1024, temperature: float 
     
     return ""
 
+def clean_json_response(text):
+    """Clean up the response to extract valid JSON"""
+    if not text:
+        print("Empty response received")
+        return "{}"
+    
+    # First remove code blocks if present
+    cleaned = re.sub(r'```(?:json)?|```', '', text).strip()
+    
+    # Try to find JSON-like content if still having issues
+    try:
+        # Find the first '{' and the last '}'
+        start = cleaned.find('{')
+        end = cleaned.rfind('}') + 1
+        if start >= 0 and end > start:
+            return cleaned[start:end]
+        return cleaned
+    except Exception as e:
+        print(f"Error during JSON extraction: {e}")
+        return "{}"
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 async def chat_orchestrator(prompt: str, context: Optional[str] = None) -> dict:
     """Main chat orchestrator that decides which agent to use"""
@@ -117,16 +140,25 @@ async def chat_orchestrator(prompt: str, context: Optional[str] = None) -> dict:
             full_prompt = prompt
         
         def make_api_call():
+            print("Making API call to Gemini for chat orchestration")
             return make_gemini_request(full_prompt, max_tokens=1024, temperature=0.3, system_prompt=CHAT_SYSTEM_PROMPT)
         
         result = await asyncio.to_thread(make_api_call)
-        result = result.replace("```json","").replace("```", "").strip()
+        
+        # Clean up the response to extract valid JSON
+        cleaned_result = clean_json_response(result)
+        
         # Parse JSON response
         try:
-            response_data = json.loads(result)
+            response_data = json.loads(cleaned_result)
             print(f"Chat Orchestrator Response: {response_data}")  # Debugging line
             return response_data
-        except json.JSONDecodeError:
+            
+        except json.JSONDecodeError as e:
+            print(f"JSON parsing error: {e}")
+            print(f"Raw result: {result}")
+            print(f"Cleaned result: {cleaned_result}")
+            
             # Fallback if JSON parsing fails
             return {
                 "response": "I'm here to help with marketing intelligence queries. What would you like to know about OmniActive's products or the market?",
