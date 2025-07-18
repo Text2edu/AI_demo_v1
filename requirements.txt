@@ -6,3 +6,4 @@ tenacity==8.2.3
 asyncio
 python-dotenv==1.0.1
 streamlit ==1.45.1
+asyncpraw~=7.8.1
